@@ -417,7 +417,8 @@
   "Calculates the appropriate indentation spaces string for a new line created at `pos` in `text`.
    - Auto-indents (+2 spaces) when the line opened unclosed forms.
    - Auto-dedents (-2 spaces per net closed bracket) when the line closed forms.
-   - Auto-dedents (-2 spaces per closing bracket) when inserting a newline immediately before closing brackets.
+   - Auto-dedents (-2 spaces per closing bracket) when inserting a newline immediately before closing brackets
+     if the document prefix has no unclosed outer forms.
    - Preserves indentation when brackets on the line are balanced."
   [^String text pos]
   (if (or (nil? text) (not (pos? (.length text))) (not (pos? pos)))
@@ -445,7 +446,10 @@
           leading-suffix-close (count (take-while (fn [[tok-type s _]]
                                                     (and (= tok-type :bracket)
                                                          (close->open (.charAt line-suffix s))))
-                                                  suffix-tokens))]
+                                                  suffix-tokens))
+          doc-prefix (.substring text 0 pos)
+          doc-binfo (compute-brackets doc-prefix)
+          doc-unclosed? (pos? (count (:unmatched doc-binfo)))]
       (cond
         ;; 1. Line-prefix closed more brackets than it opened: Auto-dedent
         (neg? unclosed)
@@ -453,8 +457,9 @@
               target (max 0 (- base-len dedent-spaces))]
           (apply str (repeat target " ")))
 
-        ;; 2. Inserting immediately before closing bracket(s) and prefix didn't open forms: Auto-dedent
-        (and (pos? leading-suffix-close) (<= unclosed 0))
+        ;; 2. Inserting immediately before closing bracket(s), prefix didn't open forms,
+        ;; AND entire document prefix has no unclosed brackets: Auto-dedent
+        (and (pos? leading-suffix-close) (<= unclosed 0) (not doc-unclosed?))
         (let [dedent-spaces (* 2 leading-suffix-close)
               target (max 0 (- base-len dedent-spaces))]
           (apply str (repeat target " ")))

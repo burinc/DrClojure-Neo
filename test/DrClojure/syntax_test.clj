@@ -338,6 +338,20 @@
       ;; Cursor right after '(+ a 1)' with balanced forms -> preserves base indent
       (is (= "    " (syntax/compute-smart-indent code 11)))))
 
+  (testing "Preserves body indentation when inserting newline inside unclosed multi-line forms before closing parens"
+    ;; (defn foo\n  [x]|) -> should indent 2 spaces for body, not dedent to 0
+    (let [code "(defn foo\n  [x])"]
+      (is (= "  " (syntax/compute-smart-indent code 15))))
+    ;; (defn foo [x]\n  (+ a 1)|) -> should preserve 2 spaces for next body expression
+    (let [code "(defn foo [x]\n  (+ a 1))"]
+      (is (= "  " (syntax/compute-smart-indent code 23))))
+    ;; (if test\n  then|) -> should preserve 2 spaces for else branch
+    (let [code "(if test\n  then)"]
+      (is (= "  " (syntax/compute-smart-indent code 15))))
+    ;; (assoc m\n  :a 1|) -> should preserve 2 spaces
+    (let [code "(assoc m\n  :a 1)"]
+      (is (= "  " (syntax/compute-smart-indent code 15)))))
+
   (testing "Handles blank or empty inputs"
     (is (= "" (syntax/compute-smart-indent "" 0)))
     (is (= "" (syntax/compute-smart-indent nil 0)))))

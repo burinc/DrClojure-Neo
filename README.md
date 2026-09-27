@@ -13,6 +13,7 @@ DrClojure is a newbie-friendly Clojure IDE inspired by DrRacket, written in Cloj
 - **REPL Command History**: Navigate previous REPL commands in the prompt using `Up` and `Down` arrow keys.
 - **In-Editor Find & Replace**: Press `Ctrl+F` (or `Ctrl+H` / `Ctrl+R` for Replace) to toggle the docked search bar. Features live match count ("X of Y"), case-sensitivity toggle, `F3` / `Shift+F3` navigation, and single or Replace-All replacements.
 - **Autocomplete (`Ctrl+Space`) in Editor & REPL**: Code completion with prefix matching ("starts with") available in both the Definitions editor and the Interactions REPL input field. Candidate pool includes Clojure special forms (`def`, `defn`, `let`, `if`, `when`, `cond`, etc.), core built-ins (`map`, `filter`, `println`, etc.), user-defined symbols from the source buffer, and runtime REPL session definitions. Powered by a dedicated low-priority daemon background caching worker (`DrClojure-Autocomplete-Cache-Worker`) that indexes buffer definitions, document tokens, and initial-character bucketed candidate maps asynchronously as you type—delivering sub-millisecond (< 0.5 ms) response times and instant doc preview navigation with zero UI thread lag or GC pressure. Features instant completion for single matches and an intelligent dual-pane popup (floating beneath the editor caret or above the REPL input line to prevent clipping) with keyboard (`Up`/`Down`/`PageUp`/`PageDown`) and mouse navigation, real-time documentation and parameter list (`arglists`) preview for the currently selected symbol, `Enter`/`Tab` insertion, `Escape` cancellation, and dynamic prefix filtering as you type. When active in the REPL prompt, keyboard navigation and completion commit take strict precedence over REPL evaluation and command history.
+- **Parinfer Smart Mode (Default)**: Full, faithful pure-Clojure implementation of Parinfer v3.13.1. Smart Mode preserves code structure while you type, automatically deciding whether to update indentation or parentheses based on your edits. Toggle or switch between **Smart Mode**, **Indent Mode**, **Paren Mode**, and **Off** via the status bar indicator, the `Edit -> Parinfer Mode` menu, the right-click context menu, or by pressing `Ctrl+Alt+P`. Passes the official Parinfer test suites.
 - **Smart Auto-Indent & Auto-Dedent on Enter**: Pressing `Enter` automatically indents 2 spaces when forms or brackets remain open, auto-dedents 2 spaces per closed bracket level when forms are closed (or when inserting a newline immediately before closing brackets), expands paired delimiters (`(|)`, `[|]`, `{|}`) with an indented middle line and dedented closing delimiter, and preserves indentation when forms on the line are balanced.
 - **Toggle Line Comment**: Press `Ctrl+/` or `Ctrl+;` to instantly toggle line comments (`; `) on the current line or selected multi-line blocks while preserving empty lines.
 - **Quick Symbol Documentation**: Press `Ctrl+Q` or `Shift+F1` on any symbol to view its namespace, arglists, docstring, and source location in a non-modal monospace popup.
@@ -58,7 +59,7 @@ DrClojure is a newbie-friendly Clojure IDE inspired by DrRacket, written in Cloj
 |   Hello, World!                                             |
 |   => nil                                                    |
 +-------------------------------------------------------------+
-| Line 5, Col 9                                       ● Ready |
+| Line 5, Col 9                ● Parinfer: Smart      ● Ready |
 +-------------------------------------------------------------+
 ```
 
@@ -102,6 +103,7 @@ clj -M:test
 | :--- | :--- |
 | `F5` | Run Definitions (execute code in editor) |
 | `Ctrl + E` | Run Selected text or current line |
+| `Ctrl + Alt + P` | Cycle Parinfer Mode (Smart -> Indent -> Paren -> Off) |
 | `Escape` | Close find bar (if open) / Stop running evaluation |
 | `Ctrl + F` | Open Find panel |
 | `Ctrl + H` / `Ctrl + R` | Open Replace panel |

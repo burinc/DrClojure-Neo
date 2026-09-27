@@ -6,17 +6,19 @@
    - Clojure cheatsheet, toolbar, status bar, and multi-window support."
   (:require [clojure.string :as str]
             [DrClojure.eval :as eval]
-            [DrClojure.syntax :as syntax])
+            [DrClojure.syntax :as syntax]
+            [DrClojure.parinfer :as parinfer])
   (:import (javax.swing JFrame JPanel JSplitPane JScrollPane JTextArea JTextField JTextPane
                         JButton JLabel JMenuBar JMenu JMenuItem JPopupMenu KeyStroke
                         JFileChooser JOptionPane JToolBar BorderFactory Box
                         SwingUtilities UIManager JDialog JViewport JComponent JCheckBox AbstractAction
-                        JList DefaultListModel DefaultListCellRenderer ListSelectionModel ScrollPaneConstants)
+                        JList DefaultListModel DefaultListCellRenderer ListSelectionModel ScrollPaneConstants
+                        JRadioButtonMenuItem ButtonGroup)
            (javax.swing.event DocumentListener CaretListener UndoableEditListener DocumentEvent$EventType ListSelectionListener PopupMenuListener)
            (javax.swing.text DefaultHighlighter$DefaultHighlightPainter JTextComponent
                              DefaultStyledDocument AbstractDocument$DefaultDocumentEvent
                              SimpleAttributeSet StyleConstants)
-           (java.awt BorderLayout FlowLayout GridLayout Dimension Font Color Insets
+           (java.awt BorderLayout FlowLayout GridLayout Dimension Font Color Insets Cursor
                      KeyboardFocusManager Toolkit Desktop Desktop$Action GraphicsEnvironment)
            (java.net URI)
            (java.awt.event ActionEvent ActionListener KeyEvent KeyAdapter
@@ -221,33 +223,47 @@
           (when-not (str/blank? t)
             (.insertString doc s "; " nil)))))))
 
+(declare update-document-diff!)
+
 (defn format-all!
   ([^JTextComponent editor] (format-all! editor nil))
   ([^JTextComponent editor status-fn]
-   (let [old-text (.getText editor)
+   (let [doc (.getDocument editor)
+         cur-len (.getLength doc)
+         old-text (.getText doc 0 cur-len)
          new-text (syntax/format-code old-text)]
      (if (= old-text new-text)
        (when status-fn (status-fn " Already formatted "))
-       (let [caret (.getCaretPosition editor)
-             max-len (.length new-text)]
-         (.setText editor new-text)
-         (.setCaretPosition editor (min max-len caret))
+       (let [caret (.getCaretPosition editor)]
+         (if (instance? DefaultStyledDocument doc)
+           (update-document-diff! doc old-text new-text)
+           (.setText editor new-text))
+         (let [new-doc-len (.getLength (.getDocument editor))]
+           (try
+             (.setCaretPosition editor (min new-doc-len (max 0 caret)))
+             (catch Throwable _ nil)))
          (when status-fn (status-fn " Formatted entire document ")))))))
 
 (defn format-selection!
   ([^JTextComponent editor] (format-selection! editor nil))
   ([^JTextComponent editor status-fn]
-   (let [old-text (.getText editor)
+   (let [doc (.getDocument editor)
+         cur-len (.getLength doc)
+         old-text (.getText doc 0 cur-len)
          sel-start (.getSelectionStart editor)
          sel-end (.getSelectionEnd editor)]
      (if (not= sel-start sel-end)
        (let [new-text (syntax/format-selection-text old-text sel-start sel-end)]
          (if (= old-text new-text)
            (when status-fn (status-fn " Selection already formatted "))
-           (let [caret (.getCaretPosition editor)
-                 max-len (.length new-text)]
-             (.setText editor new-text)
-             (.setCaretPosition editor (min max-len caret))
+           (let [caret (.getCaretPosition editor)]
+             (if (instance? DefaultStyledDocument doc)
+               (update-document-diff! doc old-text new-text)
+               (.setText editor new-text))
+             (let [new-doc-len (.getLength (.getDocument editor))]
+               (try
+                 (.setCaretPosition editor (min new-doc-len (max 0 caret)))
+                 (catch Throwable _ nil)))
              (when status-fn (status-fn " Formatted selection ")))))
        (let [pos (.getCaretPosition editor)
              doc-len (.length old-text)
@@ -258,9 +274,14 @@
              new-text (syntax/format-selection-text old-text line-start line-end)]
          (if (= old-text new-text)
            (when status-fn (status-fn " Line already formatted "))
-           (let [max-len (.length new-text)]
-             (.setText editor new-text)
-             (.setCaretPosition editor (min max-len pos))
+           (do
+             (if (instance? DefaultStyledDocument doc)
+               (update-document-diff! doc old-text new-text)
+               (.setText editor new-text))
+             (let [new-doc-len (.getLength (.getDocument editor))]
+               (try
+                 (.setCaretPosition editor (min new-doc-len (max 0 pos)))
+                 (catch Throwable _ nil)))
              (when status-fn (status-fn " Formatted current line ")))))))))
 
 (def open->matching-close
@@ -270,132 +291,319 @@
   #{\) \] \} \"})
 
 (defn handle-smart-enter!
-  [^JTextComponent editor]
-  (let [doc (.getDocument editor)
-        sel-start (.getSelectionStart editor)
-        sel-end (.getSelectionEnd editor)]
-    (when (> sel-end sel-start)
-      (.remove doc sel-start (- sel-end sel-start))
-      (.setCaretPosition editor sel-start))
-    (let [pos (.getCaretPosition editor)
-          text (.getText doc 0 (.getLength doc))
-          line-start (let [idx (.lastIndexOf text "\n" (dec pos))]
-                       (if (neg? idx) 0 (inc idx)))
-          line-prefix (.substring text line-start pos)
-          prev-ch (when (pos? pos) (.charAt text (dec pos)))
-          next-ch (when (< pos (.length text)) (.charAt text pos))
-          between-pair? (and prev-ch next-ch
-                             (contains? #{\( \[ \{} prev-ch)
-                             (= (open->matching-close prev-ch) next-ch))]
-      (if between-pair?
-        (let [base-indent (or (re-find #"^[ ]+" line-prefix) "")
-              inner-indent (str base-indent "  ")
-              close-indent base-indent
-              insert-str (str "\n" inner-indent "\n" close-indent)]
-          (.insertString doc pos insert-str nil)
-          (.setCaretPosition editor (+ pos 1 (count inner-indent))))
-        (let [indent (syntax/compute-smart-indent text pos)
-              insert-str (str "\n" indent)]
-          (.insertString doc pos insert-str nil)
-          (.setCaretPosition editor (+ pos (count insert-str))))))))
+  ([^JTextComponent editor]
+   (handle-smart-enter! editor nil))
+  ([^JTextComponent editor parinfer-mode-atom]
+   (let [parinfer-active? (fn [] (and parinfer-mode-atom
+                                      (not= @parinfer-mode-atom :off)))
+         doc (.getDocument editor)
+         sel-start (.getSelectionStart editor)
+         sel-end (.getSelectionEnd editor)]
+     (when (> sel-end sel-start)
+       (.remove doc sel-start (- sel-end sel-start))
+       (.setCaretPosition editor sel-start))
+     (let [pos (.getCaretPosition editor)
+           text (.getText doc 0 (.getLength doc))
+           line-start (let [idx (.lastIndexOf text "\n" (dec pos))]
+                        (if (neg? idx) 0 (inc idx)))
+           line-prefix (.substring text line-start pos)
+           prev-ch (when (pos? pos) (.charAt text (dec pos)))
+           next-ch (when (< pos (.length text)) (.charAt text pos))
+           between-pair? (and prev-ch next-ch
+                              (contains? #{\( \[ \{} prev-ch)
+                              (= (open->matching-close prev-ch) next-ch))]
+       (if (and between-pair? (not (parinfer-active?)))
+         (let [base-indent (or (re-find #"^[ ]+" line-prefix) "")
+               inner-indent (str base-indent "  ")
+               close-indent base-indent
+               insert-str (str "\n" inner-indent "\n" close-indent)]
+           (.insertString doc pos insert-str nil)
+           (.setCaretPosition editor (+ pos 1 (count inner-indent))))
+         (let [indent (syntax/compute-smart-indent text pos)
+               insert-str (str "\n" indent)]
+           (.insertString doc pos insert-str nil)
+           (.setCaretPosition editor (+ pos (count insert-str)))))))))
+
+;; --- Parinfer Document Diff and Integration ---
+
+(defn update-document-diff!
+  "Updates `doc` to match `new-text`, modifying only the minimal differing slice.
+   Preserves undo granularity and character styles on untouched regions."
+  [^DefaultStyledDocument doc ^String old-text ^String new-text]
+  (when (not= old-text new-text)
+    (try
+      (let [old-len (.length old-text)
+            new-len (.length new-text)
+            max-prefix (min old-len new-len)
+            prefix-len (loop [i 0]
+                         (if (and (< i max-prefix)
+                                  (= (.charAt old-text i) (.charAt new-text i)))
+                           (recur (inc i))
+                           i))
+            max-suffix (- (min old-len new-len) prefix-len)
+            suffix-len (loop [i 0]
+                         (if (and (< i max-suffix)
+                                  (= (.charAt old-text (- old-len 1 i))
+                                     (.charAt new-text (- new-len 1 i))))
+                           (recur (inc i))
+                           i))
+            remove-len (- old-len prefix-len suffix-len)
+            insert-str (.substring new-text prefix-len (- new-len suffix-len))]
+        (cond
+          (and (pos? remove-len) (pos? (.length insert-str)))
+          (.replace doc prefix-len remove-len insert-str nil)
+
+          (pos? remove-len)
+          (.remove doc prefix-len remove-len)
+
+          (pos? (.length insert-str))
+          (.insertString doc prefix-len insert-str nil)))
+      (catch Throwable _ nil))))
+
+(defn setup-parinfer!
+  "Attaches Parinfer Smart Mode to `editor`.
+   Maintains Clojure parentheses and indentation synchronization in real-time as you type.
+   Options:
+     `:initial-mode` (:smart, :indent, :paren, :off - default :smart)
+     `:on-mode-change` (fn [mode-kw] ...)
+     `:on-status-change` (fn [status-str] ...)
+   Returns map with:
+     `:mode` (atom containing current mode keyword)
+     `:set-mode!` (fn [mode-kw] ...)
+     `:cycle-mode!` (fn [] ... cycles through modes)
+     `:apply-now!` (fn [] ... runs Parinfer immediately)"
+  [^JTextComponent editor & [{:keys [initial-mode on-mode-change on-status-change]
+                             :or {initial-mode :smart}}]]
+  (let [doc ^DefaultStyledDocument (.getDocument editor)
+        mode-atom (atom initial-mode)
+        is-applying? (atom false)
+        prev-text (atom (.getText doc 0 (.getLength doc)))
+        prev-caret-pos (atom (.getCaretPosition editor))
+
+        notify-status! (fn [m]
+                         (when on-mode-change (on-mode-change m))
+                         (when on-status-change
+                           (on-status-change
+                             (case m
+                               :smart "Parinfer: Smart"
+                               :indent "Parinfer: Indent"
+                               :paren "Parinfer: Paren"
+                               :off "Parinfer: Off"
+                               "Parinfer"))))
+
+        pending-parinfer? (atom false)
+
+        run-parinfer-now!
+        (fn []
+          (when-not @is-applying?
+            (let [m @mode-atom]
+              (if (= m :off)
+                (try
+                  (let [txt (.getText doc 0 (.getLength doc))]
+                    (reset! prev-text txt)
+                    (reset! prev-caret-pos (.getCaretPosition editor)))
+                  (catch Throwable _ nil))
+                (try
+                  (let [cur-len (.getLength doc)
+                        current-text (.getText doc 0 cur-len)
+                        old-text @prev-text
+                        old-caret @prev-caret-pos
+                        caret (.getCaretPosition editor)
+                        [cur-line cur-x] (parinfer/offset->line-col current-text caret)
+                        [prev-line prev-x] (parinfer/offset->line-col old-text old-caret)
+                        change (parinfer/compute-text-change old-text current-text)
+                        opts {:cursor-line cur-line
+                              :cursor-x cur-x
+                              :prev-cursor-line prev-line
+                              :prev-cursor-x prev-x
+                              :changes (when change [change])}
+                        res (case m
+                              :smart (parinfer/smart-mode current-text opts)
+                              :indent (parinfer/indent-mode current-text opts)
+                              :paren (parinfer/paren-mode current-text opts)
+                              nil)]
+                    (if (and res (:success res))
+                      (let [out-text (:text res)]
+                        (if (not= out-text current-text)
+                          (do
+                            (reset! is-applying? true)
+                            (try
+                              (update-document-diff! doc current-text out-text)
+                              (let [tgt-off (parinfer/line-col->offset out-text
+                                                                      (or (:cursor-line res) cur-line)
+                                                                      (or (:cursor-x res) cur-x))
+                                    clamped-off (min (.getLength doc) (max 0 tgt-off))]
+                                (when (not= (.getCaretPosition editor) clamped-off)
+                                  (try
+                                    (.setCaretPosition editor clamped-off)
+                                    (catch Throwable _ nil))))
+                              (finally
+                                (reset! is-applying? false)))
+                            (reset! prev-text out-text)
+                            (reset! prev-caret-pos (.getCaretPosition editor)))
+                          (do
+                            (reset! prev-text current-text)
+                            (reset! prev-caret-pos caret))))
+                      (do
+                        (reset! prev-text current-text)
+                        (reset! prev-caret-pos caret))))
+                  (catch Throwable _ nil))))))
+
+        schedule-parinfer!
+        (fn []
+          (when (compare-and-set! pending-parinfer? false true)
+            (SwingUtilities/invokeLater
+              (fn []
+                (reset! pending-parinfer? false)
+                (run-parinfer-now!)))))]
+
+    ;; DocumentListener to trigger Parinfer on edits
+    (.addDocumentListener doc
+      (proxy [DocumentListener] []
+        (insertUpdate [e] (when-not @is-applying? (schedule-parinfer!)))
+        (removeUpdate [e] (when-not @is-applying? (schedule-parinfer!)))
+        (changedUpdate [e] nil)))
+
+    ;; CaretListener to update previous cursor position on caret movements
+    (.addCaretListener editor
+      (proxy [CaretListener] []
+        (caretUpdate [e]
+          (when-not @is-applying?
+            (reset! prev-caret-pos (.getDot e))))))
+
+    (notify-status! @mode-atom)
+
+    (let [set-mode-fn! (fn [new-mode]
+                         (reset! mode-atom new-mode)
+                         (notify-status! new-mode)
+                         (when-not (= new-mode :off)
+                           (run-parinfer-now!)))
+          cycle-mode-fn! (fn []
+                           (let [next-mode (case @mode-atom
+                                             :smart :indent
+                                             :indent :paren
+                                             :paren :off
+                                             :off :smart
+                                             :smart)]
+                             (set-mode-fn! next-mode)
+                             next-mode))]
+      {:mode mode-atom
+       :set-mode! set-mode-fn!
+       :cycle-mode! cycle-mode-fn!
+       :apply-now! run-parinfer-now!})))
 
 (defn setup-auto-brackets!
-  [^JTextComponent editor]
-  (.addKeyListener editor
-    (proxy [KeyAdapter] []
-      (keyTyped [^KeyEvent e]
-        (when-not (or (.isControlDown e) (.isAltDown e) (.isMetaDown e))
-          (let [ch (.getKeyChar e)]
-            (cond
-              (contains? open->matching-close ch)
-              (let [doc (.getDocument editor)
-                    sel-start (.getSelectionStart editor)
-                    sel-end (.getSelectionEnd editor)
-                    close-ch (open->matching-close ch)]
-                (if (> sel-end sel-start)
-                  (let [sel-text (.getSelectedText editor)
-                        wrapped (str ch sel-text close-ch)]
-                    (.consume e)
-                    (.remove doc sel-start (- sel-end sel-start))
-                    (.insertString doc sel-start wrapped nil)
-                    (.setSelectionStart editor sel-start)
-                    (.setSelectionEnd editor (+ sel-start (count wrapped))))
-                  (let [caret (.getCaretPosition editor)
-                        doc-len (.getLength doc)
-                        next-ch (when (< caret doc-len) (.charAt (.getText doc caret 1) 0))]
-                    (if (and (= ch \") (= next-ch \"))
-                      (do
-                        (.consume e)
-                        (.setCaretPosition editor (inc caret)))
-                      (do
-                        (.consume e)
-                        (.insertString doc caret (str ch close-ch) nil)
-                        (.setCaretPosition editor (inc caret)))))))
+  "Configures auto-closing of delimiters. When Parinfer is active,
+   paren balancing is delegated to Parinfer Smart Mode."
+  ([^JTextComponent editor]
+   (setup-auto-brackets! editor nil))
+  ([^JTextComponent editor parinfer-mode-atom]
+   (let [parinfer-active? (fn [] (and parinfer-mode-atom
+                                      (not= @parinfer-mode-atom :off)))]
+     (.addKeyListener editor
+       (proxy [KeyAdapter] []
+         (keyTyped [^KeyEvent e]
+           (when-not (or (.isControlDown e) (.isAltDown e) (.isMetaDown e))
+             (let [ch (.getKeyChar e)]
+               (cond
+                 (contains? open->matching-close ch)
+                 (let [doc (.getDocument editor)
+                       sel-start (.getSelectionStart editor)
+                       sel-end (.getSelectionEnd editor)
+                       close-ch (open->matching-close ch)]
+                   (if (> sel-end sel-start)
+                     (let [sel-text (.getSelectedText editor)
+                           wrapped (str ch sel-text close-ch)]
+                       (.consume e)
+                       (.remove doc sel-start (- sel-end sel-start))
+                       (.insertString doc sel-start wrapped nil)
+                       (.setSelectionStart editor sel-start)
+                       (.setSelectionEnd editor (+ sel-start (count wrapped))))
+                     ;; When Parinfer is active and ch is a paren/bracket, let Parinfer infer close delimiter!
+                     (if (and (parinfer-active?) (not= ch \"))
+                       nil
+                       (let [caret (.getCaretPosition editor)
+                             doc-len (.getLength doc)
+                             next-ch (when (< caret doc-len) (.charAt (.getText doc caret 1) 0))]
+                         (if (and (= ch \") (= next-ch \"))
+                           (do
+                             (.consume e)
+                             (.setCaretPosition editor (inc caret)))
+                           (do
+                             (.consume e)
+                             (.insertString doc caret (str ch close-ch) nil)
+                             (.setCaretPosition editor (inc caret))))))))
 
-              (contains? close-delimiters ch)
-              (let [sel-start (.getSelectionStart editor)
-                    sel-end (.getSelectionEnd editor)]
-                (when (= sel-start sel-end)
-                  (let [doc (.getDocument editor)
-                        caret (.getCaretPosition editor)
-                        doc-len (.getLength doc)]
-                    (when (< caret doc-len)
-                      (let [next-ch (.charAt (.getText doc caret 1) 0)]
-                        (when (= ch next-ch)
-                          (.consume e)
-                          (.setCaretPosition editor (inc caret))))))))
+                 ;; When Parinfer is active, don't consume closing parens; let Parinfer process them
+                 (contains? close-delimiters ch)
+                 (when-not (parinfer-active?)
+                   (let [sel-start (.getSelectionStart editor)
+                         sel-end (.getSelectionEnd editor)]
+                     (when (= sel-start sel-end)
+                       (let [doc (.getDocument editor)
+                             caret (.getCaretPosition editor)
+                             doc-len (.getLength doc)]
+                         (when (< caret doc-len)
+                           (let [next-ch (.charAt (.getText doc caret 1) 0)]
+                             (when (= ch next-ch)
+                               (.consume e)
+                               (.setCaretPosition editor (inc caret)))))))))
 
-              :else nil))))
+                 :else nil))))
 
-      (keyPressed [^KeyEvent e]
-        (when-not (or (.isControlDown e) (.isAltDown e) (.isMetaDown e))
-          (when (= (.getKeyCode e) KeyEvent/VK_BACK_SPACE)
-            (let [sel-start (.getSelectionStart editor)
-                  sel-end (.getSelectionEnd editor)]
-              (when (= sel-start sel-end)
-                (let [caret (.getCaretPosition editor)
-                      doc (.getDocument editor)
-                      doc-len (.getLength doc)]
-                  (when (and (pos? caret) (< caret doc-len))
-                    (let [prev-ch (.charAt (.getText doc (dec caret) 1) 0)
-                          next-ch (.charAt (.getText doc caret 1) 0)]
-                      (when (= (open->matching-close prev-ch) next-ch)
-                        (.consume e)
-                        (.remove doc (dec caret) 2)
-                        (.setCaretPosition editor (dec caret))))))))))))))
+         (keyPressed [^KeyEvent e]
+           (when-not (or (.isControlDown e) (.isAltDown e) (.isMetaDown e))
+             (when (= (.getKeyCode e) KeyEvent/VK_BACK_SPACE)
+               ;; When Parinfer is active, standard backspace deletes char and Parinfer rebalances
+               (when-not (parinfer-active?)
+                 (let [sel-start (.getSelectionStart editor)
+                       sel-end (.getSelectionEnd editor)]
+                   (when (= sel-start sel-end)
+                     (let [caret (.getCaretPosition editor)
+                           doc (.getDocument editor)
+                           doc-len (.getLength doc)]
+                       (when (and (pos? caret) (< caret doc-len))
+                         (let [prev-ch (.charAt (.getText doc (dec caret) 1) 0)
+                               next-ch (.charAt (.getText doc caret 1) 0)]
+                           (when (= (open->matching-close prev-ch) next-ch)
+                             (.consume e)
+                             (.remove doc (dec caret) 2)
+                             (.setCaretPosition editor (dec caret)))))))))))))))))
 
 (defn setup-editor-keys!
-  [^JTextComponent editor toggle-comment-fn!]
-  (.setFocusTraversalKeys editor KeyboardFocusManager/FORWARD_TRAVERSAL_KEYS java.util.Collections/EMPTY_SET)
-  (.setFocusTraversalKeys editor KeyboardFocusManager/BACKWARD_TRAVERSAL_KEYS java.util.Collections/EMPTY_SET)
-  (let [im (.getInputMap editor)
-        am (.getActionMap editor)]
-    (.put im (KeyStroke/getKeyStroke "TAB") "block-indent")
-    (.put am "block-indent"
-      (proxy [AbstractAction] []
-        (actionPerformed [e]
-          (indent-selection! editor))))
-    (.put im (KeyStroke/getKeyStroke "shift TAB") "block-unindent")
-    (.put im (KeyStroke/getKeyStroke KeyEvent/VK_TAB KeyEvent/SHIFT_DOWN_MASK) "block-unindent")
-    (.put am "block-unindent"
-      (proxy [AbstractAction] []
-        (actionPerformed [e]
-          (unindent-selection! editor))))
+  ([^JTextComponent editor toggle-comment-fn!]
+   (setup-editor-keys! editor toggle-comment-fn! nil))
+  ([^JTextComponent editor toggle-comment-fn! parinfer-mode-atom]
+   (.setFocusTraversalKeys editor KeyboardFocusManager/FORWARD_TRAVERSAL_KEYS java.util.Collections/EMPTY_SET)
+   (.setFocusTraversalKeys editor KeyboardFocusManager/BACKWARD_TRAVERSAL_KEYS java.util.Collections/EMPTY_SET)
+   (let [im (.getInputMap editor)
+         am (.getActionMap editor)]
+     (.put im (KeyStroke/getKeyStroke "TAB") "block-indent")
+     (.put am "block-indent"
+       (proxy [AbstractAction] []
+         (actionPerformed [e]
+           (indent-selection! editor))))
+     (.put im (KeyStroke/getKeyStroke "shift TAB") "block-unindent")
+     (.put im (KeyStroke/getKeyStroke KeyEvent/VK_TAB KeyEvent/SHIFT_DOWN_MASK) "block-unindent")
+     (.put am "block-unindent"
+       (proxy [AbstractAction] []
+         (actionPerformed [e]
+           (unindent-selection! editor))))
 
-    (.put im (KeyStroke/getKeyStroke "ENTER") "smart-enter")
-    (.put am "smart-enter"
-      (proxy [AbstractAction] []
-        (actionPerformed [e]
-          (handle-smart-enter! editor))))
+     (.put im (KeyStroke/getKeyStroke "ENTER") "smart-enter")
+     (.put am "smart-enter"
+       (proxy [AbstractAction] []
+         (actionPerformed [e]
+           (handle-smart-enter! editor parinfer-mode-atom))))
 
-    (.put im (KeyStroke/getKeyStroke "control SLASH") "toggle-comment")
-    (.put im (KeyStroke/getKeyStroke KeyEvent/VK_SLASH KeyEvent/CTRL_DOWN_MASK) "toggle-comment")
-    (.put im (KeyStroke/getKeyStroke "control SEMICOLON") "toggle-comment")
-    (.put im (KeyStroke/getKeyStroke KeyEvent/VK_SEMICOLON KeyEvent/CTRL_DOWN_MASK) "toggle-comment")
-    (.put am "toggle-comment"
-      (proxy [AbstractAction] []
-        (actionPerformed [e]
-          (toggle-comment-fn!))))))
+     (.put im (KeyStroke/getKeyStroke "control SLASH") "toggle-comment")
+     (.put im (KeyStroke/getKeyStroke KeyEvent/VK_SLASH KeyEvent/CTRL_DOWN_MASK) "toggle-comment")
+     (.put im (KeyStroke/getKeyStroke "control SEMICOLON") "toggle-comment")
+     (.put im (KeyStroke/getKeyStroke KeyEvent/VK_SEMICOLON KeyEvent/CTRL_DOWN_MASK) "toggle-comment")
+     (.put am "toggle-comment"
+       (proxy [AbstractAction] []
+         (actionPerformed [e]
+           (toggle-comment-fn!)))))))
 
 (defn jump-to-definition!
   [^JFrame frame ^JTextComponent editor & [_set-status!]]
@@ -1206,6 +1414,8 @@
   ([^JTextComponent editor jump-fn! rename-fn! doc-fn! comment-fn! format-all-fn! format-sel-fn! find-fn! replace-fn!]
    (setup-editor-context-menu! editor jump-fn! rename-fn! doc-fn! comment-fn! format-all-fn! format-sel-fn! nil find-fn! replace-fn!))
   ([^JTextComponent editor jump-fn! rename-fn! doc-fn! comment-fn! format-all-fn! format-sel-fn! autocomplete-fn! find-fn! replace-fn!]
+   (setup-editor-context-menu! editor jump-fn! rename-fn! doc-fn! comment-fn! format-all-fn! format-sel-fn! autocomplete-fn! find-fn! replace-fn! nil))
+  ([^JTextComponent editor jump-fn! rename-fn! doc-fn! comment-fn! format-all-fn! format-sel-fn! autocomplete-fn! find-fn! replace-fn! parinfer-ctrl]
    (let [popup (JPopupMenu.)
          item-jump (JMenuItem. "Jump to Definition (F12)")
          item-rename (JMenuItem. "Rename Symbol... (Shift+F6)")
@@ -1245,6 +1455,27 @@
      (.add popup item-comment)
      (.add popup item-indent)
      (.add popup item-unindent)
+     (when parinfer-ctrl
+       (let [menu-parinfer (JMenu. "Parinfer Mode")
+             p-smart (JMenuItem. "Smart Mode")
+             p-indent (JMenuItem. "Indent Mode")
+             p-paren (JMenuItem. "Paren Mode")
+             p-off (JMenuItem. "Turn Off Parinfer")
+             p-cycle (JMenuItem. "Cycle Mode (Ctrl+Alt+P)")]
+         (.addActionListener p-smart (proxy [ActionListener] [] (actionPerformed [e] ((:set-mode! parinfer-ctrl) :smart))))
+         (.addActionListener p-indent (proxy [ActionListener] [] (actionPerformed [e] ((:set-mode! parinfer-ctrl) :indent))))
+         (.addActionListener p-paren (proxy [ActionListener] [] (actionPerformed [e] ((:set-mode! parinfer-ctrl) :paren))))
+         (.addActionListener p-off (proxy [ActionListener] [] (actionPerformed [e] ((:set-mode! parinfer-ctrl) :off))))
+         (.addActionListener p-cycle (proxy [ActionListener] [] (actionPerformed [e] ((:cycle-mode! parinfer-ctrl)))))
+         (.add menu-parinfer p-smart)
+         (.add menu-parinfer p-indent)
+         (.add menu-parinfer p-paren)
+         (.addSeparator menu-parinfer)
+         (.add menu-parinfer p-off)
+         (.addSeparator menu-parinfer)
+         (.add menu-parinfer p-cycle)
+         (.addSeparator popup)
+         (.add popup menu-parinfer)))
      (.addSeparator popup)
      (.add popup item-find)
      (.add popup item-replace)
@@ -1417,11 +1648,22 @@
         ;; Definitions Editor & Line Numbers
         doc (DefaultStyledDocument.)
         editor (proxy [JTextPane] [doc]
+                 (getPreferredSize []
+                   (try
+                     (proxy-super getPreferredSize)
+                     (catch Throwable _
+                       (Dimension. (max 100 (.getWidth this))
+                                   (max 100 (.getHeight this))))))
                  (getScrollableTracksViewportWidth []
-                   (let [parent (.getParent this)]
-                     (if (instance? JViewport parent)
-                       (>= (.getWidth parent) (.. this getUI (getPreferredSize this) width))
-                       true))))
+                   (try
+                     (let [parent (.getParent this)]
+                       (if (instance? JViewport parent)
+                         (let [pref (try (.. this getUI (getPreferredSize this)) (catch Throwable _ nil))]
+                           (if pref
+                             (>= (.getWidth parent) (.width pref))
+                             true))
+                         true))
+                     (catch Throwable _ true))))
         _ (do (.setMargin editor (Insets. 2 4 2 4))
               (.setBackground editor Color/WHITE)
               (.setCaretColor editor (Color. 30 30 30))
@@ -1444,11 +1686,22 @@
         ;; --- Unified Interactions Console (Output + REPL input) ---
         interactions-doc (DefaultStyledDocument.)
         interactions-pane (proxy [JTextPane] [interactions-doc]
+                            (getPreferredSize []
+                              (try
+                                (proxy-super getPreferredSize)
+                                (catch Throwable _
+                                  (Dimension. (max 100 (.getWidth this))
+                                              (max 100 (.getHeight this))))))
                             (getScrollableTracksViewportWidth []
-                              (let [parent (.getParent this)]
-                                (if (instance? JViewport parent)
-                                  (>= (.getWidth parent) (.. this getUI (getPreferredSize this) width))
-                                  true))))
+                              (try
+                                (let [parent (.getParent this)]
+                                  (if (instance? JViewport parent)
+                                    (let [pref (try (.. this getUI (getPreferredSize this)) (catch Throwable _ nil))]
+                                      (if pref
+                                        (>= (.getWidth parent) (.width pref))
+                                        true))
+                                    true))
+                                (catch Throwable _ true))))
         _ (do (.setName interactions-pane "interactions-console")
               (.setMargin interactions-pane (Insets. 4 6 4 6))
               (.setBackground interactions-pane (Color. 250 250 250))
@@ -1490,12 +1743,47 @@
         ;; Status Bar
         status-panel (JPanel. (BorderLayout.))
         status-caret (JLabel. " Line 1, Col 1 ")
+        status-east-panel (JPanel. (FlowLayout. FlowLayout/RIGHT 12 0))
+        status-parinfer (JLabel. "● Parinfer: Smart")
         status-state (JLabel. " ● Ready ")
-        _ (do (.setForeground status-state (Color. 0 130 0))
+        _ (do (.setFont status-parinfer (Font. "Segoe UI" Font/BOLD 12))
+              (.setForeground status-parinfer (Color. 0 120 180))
+              (.setCursor status-parinfer (Cursor/getPredefinedCursor Cursor/HAND_CURSOR))
+              (.setToolTipText status-parinfer "Parinfer Mode: click to switch, or press Ctrl+Alt+P")
+              (.setOpaque status-east-panel false)
+              (.add status-east-panel status-parinfer)
+              (.add status-east-panel status-state)
+              (.setForeground status-state (Color. 0 130 0))
               (.setFont status-state (Font. "Segoe UI" Font/BOLD 12))
               (.setBorder status-panel (BorderFactory/createEmptyBorder 3 6 3 6))
               (.add status-panel status-caret BorderLayout/WEST)
-              (.add status-panel status-state BorderLayout/EAST))
+              (.add status-panel status-east-panel BorderLayout/EAST))
+
+        ;; Parinfer Mode Controls & Menu Items
+        rb-smart (JRadioButtonMenuItem. "Smart Mode (Default)" true)
+        rb-indent (JRadioButtonMenuItem. "Indent Mode" false)
+        rb-paren (JRadioButtonMenuItem. "Paren Mode" false)
+        rb-off (JRadioButtonMenuItem. "Turn Off Parinfer" false)
+        bg-parinfer (ButtonGroup.)
+        item-cycle-parinfer (JMenuItem. "Cycle Parinfer Mode")
+        _ (.setAccelerator item-cycle-parinfer (KeyStroke/getKeyStroke "control alt P"))
+        update-parinfer-ui! (fn [m]
+                              (SwingUtilities/invokeLater
+                                (fn []
+                                  (case m
+                                    :smart (do (.setText status-parinfer "● Parinfer: Smart")
+                                               (.setForeground status-parinfer (Color. 0 120 180))
+                                               (.setSelected rb-smart true))
+                                    :indent (do (.setText status-parinfer "● Parinfer: Indent")
+                                                (.setForeground status-parinfer (Color. 180 100 20))
+                                                (.setSelected rb-indent true))
+                                    :paren (do (.setText status-parinfer "● Parinfer: Paren")
+                                               (.setForeground status-parinfer (Color. 130 40 180))
+                                               (.setSelected rb-paren true))
+                                    :off (do (.setText status-parinfer "○ Parinfer: Off")
+                                             (.setForeground status-parinfer (Color. 140 140 140))
+                                             (.setSelected rb-off true))
+                                    nil))))
 
         ;; Toolbar Buttons
         btn-run (JButton. "▶ Run (F5)")
@@ -1726,7 +2014,13 @@
                     open-replace! (:open-replace! find-ctrl)
                     close-find! (:close-panel! find-ctrl)
                     find-next! (:find-next! find-ctrl)
-                    find-prev! (:find-prev! find-ctrl)]
+                    find-prev! (:find-prev! find-ctrl)
+                    parinfer-ctrl (setup-parinfer! editor
+                                    {:initial-mode :smart
+                                     :on-mode-change update-parinfer-ui!})
+                    set-parinfer-mode! (:set-mode! parinfer-ctrl)
+                    cycle-parinfer-mode! (:cycle-mode! parinfer-ctrl)
+                    parinfer-mode (:mode parinfer-ctrl)]
                 (.add definitions-panel find-panel BorderLayout/SOUTH)
 
                 ;; --- Interactions Console Key Bindings & Stdin Handlers ---
@@ -1839,14 +2133,33 @@
                       (swap! font-size #(max 10 (- % 2)))
                       (apply-font! @font-size))))
 
+                ;; Parinfer Controller & Editor Listeners
+                ;; Click on status bar label to cycle Parinfer mode
+                (.addMouseListener status-parinfer
+                  (proxy [MouseAdapter] []
+                    (mouseClicked [e]
+                      (cycle-parinfer-mode!))))
+
+                ;; Action listeners for Parinfer menu radio buttons & cycle item
+                (.addActionListener rb-smart (proxy [ActionListener] [] (actionPerformed [e] (set-parinfer-mode! :smart))))
+                (.addActionListener rb-indent (proxy [ActionListener] [] (actionPerformed [e] (set-parinfer-mode! :indent))))
+                (.addActionListener rb-paren (proxy [ActionListener] [] (actionPerformed [e] (set-parinfer-mode! :paren))))
+                (.addActionListener rb-off (proxy [ActionListener] [] (actionPerformed [e] (set-parinfer-mode! :off))))
+                (.addActionListener item-cycle-parinfer (proxy [ActionListener] [] (actionPerformed [e] (cycle-parinfer-mode!))))
+
                 ;; Setup Editor Listeners & Shortcuts
                 (setup-bracket-matching! editor bracket-info)
-                (setup-auto-brackets! editor)
-                (setup-editor-keys! editor comment-action!)
+                (setup-auto-brackets! editor parinfer-mode)
+                (setup-editor-keys! editor comment-action! parinfer-mode)
                 (setup-autocomplete-keys! editor active-popup)
 
                 (let [im (.getInputMap editor)
                       am (.getActionMap editor)]
+                  (.put im (KeyStroke/getKeyStroke "control alt P") "cycle-parinfer")
+                  (.put am "cycle-parinfer"
+                    (proxy [javax.swing.AbstractAction] []
+                      (actionPerformed [e] (cycle-parinfer-mode!))))
+
                   (.put im (KeyStroke/getKeyStroke "F5") "run-definitions")
                   (.put am "run-definitions"
                     (proxy [javax.swing.AbstractAction] []
@@ -1917,18 +2230,18 @@
                           (close-find!)
                           (stop-current-eval!))))))
 
-                (setup-editor-context-menu! editor jump-action! rename-action! quick-doc-action! comment-action! format-all-action! format-selection-action! autocomplete-action! open-find! open-replace!)
+                (setup-editor-context-menu! editor jump-action! rename-action! quick-doc-action! comment-action! format-all-action! format-selection-action! autocomplete-action! open-find! open-replace! parinfer-ctrl)
 
                 (.. editor getDocument (addDocumentListener
                   (proxy [DocumentListener] []
                     (insertUpdate [e]
                       (update-dirty!)
-                      (update-line-numbers! editor line-numbers))
+                      (SwingUtilities/invokeLater #(update-line-numbers! editor line-numbers)))
                     (removeUpdate [e]
                       (update-dirty!)
-                      (update-line-numbers! editor line-numbers))
+                      (SwingUtilities/invokeLater #(update-line-numbers! editor line-numbers)))
                     (changedUpdate [e]
-                      (update-line-numbers! editor line-numbers)))))
+                      (SwingUtilities/invokeLater #(update-line-numbers! editor line-numbers))))))
 
                 (.addCaretListener editor
                   (proxy [CaretListener] []
@@ -2089,6 +2402,18 @@
                       item-indent (JMenuItem. "Indent Selection")
                       item-unindent (JMenuItem. "Unindent Selection")
                       item-clear (JMenuItem. "Clear Output")
+                      menu-parinfer (JMenu. "Parinfer Mode")
+                      _ (do (.add bg-parinfer rb-smart)
+                            (.add bg-parinfer rb-indent)
+                            (.add bg-parinfer rb-paren)
+                            (.add bg-parinfer rb-off)
+                            (.add menu-parinfer rb-smart)
+                            (.add menu-parinfer rb-indent)
+                            (.add menu-parinfer rb-paren)
+                            (.addSeparator menu-parinfer)
+                            (.add menu-parinfer rb-off)
+                            (.addSeparator menu-parinfer)
+                            (.add menu-parinfer item-cycle-parinfer))
                       _ (do (.setAccelerator item-undo (KeyStroke/getKeyStroke "control Z"))
                             (.setAccelerator item-redo (KeyStroke/getKeyStroke "control Y"))
                             (.setAccelerator item-find (KeyStroke/getKeyStroke "control F"))
@@ -2139,6 +2464,8 @@
                             (.add menu-edit item-comment)
                             (.add menu-edit item-indent)
                             (.add menu-edit item-unindent)
+                            (.addSeparator menu-edit)
+                            (.add menu-edit menu-parinfer)
                             (.addSeparator menu-edit)
                             (.add menu-edit item-clear))
 

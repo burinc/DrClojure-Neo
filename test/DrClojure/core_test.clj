@@ -279,7 +279,25 @@
       (.setText pane "  (let [x 1]\n    ())")
       (.setCaretPosition pane (+ (.indexOf (.getText pane) "(" 12) 1))
       (ui/handle-smart-enter! pane)
-      (is (= "  (let [x 1]\n    (\n      \n    ))" (.getText pane))))))
+      (is (= "  (let [x 1]\n    (\n      \n    ))" (.getText pane)))))
+
+  (testing "Smart enter with Parinfer active maintains proper body indentation and does not off-by-1"
+    (let [pane (JTextPane.)
+          parinfer-mode (atom :smart)]
+      (.setText pane "(defn foo\n  [x])")
+      ;; Caret before ')'
+      (.setCaretPosition pane 15)
+      (ui/handle-smart-enter! pane parinfer-mode)
+      (is (= "(defn foo\n  [x]\n  )" (.getText pane)))
+      (is (= 18 (.getCaretPosition pane))))
+
+    (let [pane (JTextPane.)
+          parinfer-mode (atom :smart)]
+      (.setText pane "()")
+      (.setCaretPosition pane 1)
+      (ui/handle-smart-enter! pane parinfer-mode)
+      (is (= "(\n  )" (.getText pane)))
+      (is (= 4 (.getCaretPosition pane))))))
 
 (deftest find-replace-panel-test
   (testing "Inline find and replace panel operations"
